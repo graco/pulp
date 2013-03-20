@@ -24,9 +24,10 @@ from pulp.server.config import config as pulp_conf
 
 from pulp_node import constants
 from pulp_node.manifest import Manifest
-from pulp_node.importers.reports import ImporterReport
 from pulp_node.importers.inventory import UnitInventory, unit_dictionary
 from pulp_node.importers.download import Batch, DownloadListener
+from pulp_node.error import (NodeError, GetChildUnitsError, GetParentUnitsError, AddUnitError,
+    DeleteUnitError, CaughtException)
 
 
 log = getLogger(__name__)
@@ -34,10 +35,6 @@ log = getLogger(__name__)
 
 # --- i18n ------------------------------------------------------------------------------
 
-FETCH_CHILD_UNITS_FAILED = _('Fetch child units failed for repository: %(r)s')
-FETCH_PARENT_UNITS_FAILED = _('Fetch parent units failed for repository: %(r)s')
-ADD_UNITS_FAILED = _('Add units failed on repository: %(r)s')
-PURGE_UNITS_FAILED = _('Purge units failed on repository: %(r)s')
 STRATEGY_UNSUPPORTED = _('Importer strategy "%(s)s" not supported')
 
 
@@ -48,6 +45,8 @@ class ImporterStrategy(object):
     """
     This object provides the transport independent content unit
     synchronization strategies used by nodes importer plugins.
+    :ivar repo_id: The repository ID.
+    :type repo_id: str
     :ivar cancelled: The flag indicating that the current operation
         has been cancelled.
     :type cancelled: bool
@@ -59,9 +58,11 @@ class ImporterStrategy(object):
     :type downloader: pulp.common.download.backends.base.DownloadBackend
     :ivar progress: A progress reporting object.
     :type progress: RepositoryProgress
+    :ivar report: A summary report.
+    :type report: pulp_node.importers.reports.ImporterReport
     """
 
-    def __init__(self, conduit, config, downloader, progress):
+    def __init__(self, conduit, config, downloader, progress, report):
         """
         :param conduit: Provides access to relevant Pulp functionality.
         :type conduit: pulp.server.conduits.repo_sync.RepoSyncConduit
@@ -71,16 +72,34 @@ class ImporterStrategy(object):
         :type downloader: pulp.common.download.backends.base.DownloadBackend
         :param progress: A progress reporting object.
         :type progress: pulp_node.importers.reports.RepositoryProgress
+        :param report: A summary report.
+        :type report: pulp_node.importers.reports.ImporterReport
         """
         self.cancelled = False
         self.conduit = conduit
         self.config = config
         self.downloader = downloader
         self.progress = progress
+        self.report = report
 
     def synchronize(self, repo_id):
         """
         Synchronize the content units associated with the specified repository.
+        :param repo_id: The repository ID.
+        :type repo_id: str
+        :return: A synchronization report.
+        :rtype: Report
+        """
+        try:
+            self._synchronize(repo_id)
+        except NodeError, ne:
+            self.report.errors.append(ne)
+        except Exception, e:
+            log.exception(repo_id)
+            self.report.errors.append(CaughtException(e, repo_id))
+
+    def _synchronize(self, repo_id):
+        """
         Specific strategies defined by subclasses.
         :param repo_id: The repository ID.
         :type repo_id: str
@@ -104,8 +123,12 @@ class ImporterStrategy(object):
         :param unit: The unit to be added.
         :type unit: Unit
         """
-        self.conduit.save_unit(unit)
-        self.progress.unit_added(details=unit.storage_path)
+        try:
+            self.conduit.save_unit(unit)
+            self.progress.unit_added(details=unit.storage_path)
+        except Exception:
+            log.exception(unit.id)
+            self.report.errors.append(AddUnitError())
 
     # --- protected ---------------------------------------------------------------------
 
@@ -122,19 +145,21 @@ class ImporterStrategy(object):
         try:
             units = self._child_units()
             child.update(units)
+        except NodeError:
+            raise
         except Exception:
-            msg = FETCH_CHILD_UNITS_FAILED % {'r': repo_id}
-            log.exception(msg)
-            raise Exception(msg)
+            log.exception(repo_id)
+            raise GetChildUnitsError(repo_id)
         # fetch parent units
         parent = {}
         try:
             units = self._parent_units()
             parent.update(units)
+        except NodeError:
+            raise
         except Exception:
-            msg = FETCH_PARENT_UNITS_FAILED % {'r': repo_id}
-            log.exception(msg)
-            raise Exception(msg)
+            log.exception(repo_id)
+            raise GetParentUnitsError(repo_id)
         return UnitInventory(child, parent)
 
     def _missing_units(self, unit_inventory):
@@ -178,11 +203,7 @@ class ImporterStrategy(object):
         transport callback.
         :param unit_inventory: The inventory of both parent and child content units.
         :type unit_inventory: UnitInventory
-        :return: The list of failed that failed to be added.
-            Each item is: (unit, exception)
-        :rtype: list
         """
-        failed = []
         units = self._missing_units(unit_inventory)
         self.progress.begin_adding_units(len(units))
         batch = Batch()
@@ -190,21 +211,18 @@ class ImporterStrategy(object):
             if self.cancelled:
                 break
             download = unit.get('_download')
-            # unit has no file associated
             if not download:
-                try:
-                    self.add_unit(child_unit)
-                except Exception, e:
-                    failed.append((child_unit, e))
+                # unit has no file associated
+                self.add_unit(child_unit)
                 continue
             url = download['url']
             batch.add(url, child_unit)
-        if not self.cancelled:
-            listener = DownloadListener(self, batch)
-            self.downloader.event_listener = listener
-            self.downloader.download(batch.request_list)
-            failed.extend(listener.failed)
-        return failed
+        if self.cancelled:
+            return
+        listener = DownloadListener(self, batch)
+        self.downloader.event_listener = listener
+        self.downloader.download(batch.request_list)
+        self.report.errors.extend(listener.errors)
 
     def _delete_units(self, unit_inventory):
         """
@@ -212,22 +230,16 @@ class ImporterStrategy(object):
         but are not contained in the parent inventory and un-associate them.
         :param unit_inventory: The inventory of both parent and child content units.
         :type unit_inventory: UnitInventory
-        :return: The list of units that failed to be un-associated.
-            Each item is: (unit, exception)
-        :rtype: list
         """
-        failed = []
-        succeeded = []
         units = unit_inventory.child_only()
         for unit in units:
             if self.cancelled:
                 break
             try:
                 self.conduit.remove_unit(unit)
-                succeeded.append(unit)
-            except Exception, e:
-                failed.append((unit, e))
-        return failed
+            except Exception:
+                log.exception(unit.id)
+                self.report.errors.append(DeleteUnitError())
 
     def _child_units(self):
         """
@@ -267,7 +279,7 @@ class Mirror(ImporterStrategy):
     repository in the parent.  Maintains an exact mirror.
     """
 
-    def synchronize(self, repo_id):
+    def _synchronize(self, repo_id):
         """
         Performs the following steps:
           1. Read the (parent) manifest.
@@ -276,34 +288,10 @@ class Mirror(ImporterStrategy):
           4. Delete units specified in the child but not in the parent.
         :param repo_id: The repository ID.
         :type repo_id: str
-        :return: A synchronization report.
-        :rtype: Report
         """
         unit_inventory = self._unit_inventory(repo_id)
-
-        # add missing units
-        add_failed = []
-        try:
-            failed = self._add_units(unit_inventory)
-            if failed:
-                add_failed.extend(failed)
-        except Exception:
-            msg = ADD_UNITS_FAILED % {'r': repo_id}
-            log.exception(msg)
-            raise Exception(msg)
-
-        # delete extra units
-        delete_failed = []
-        try:
-            failed = self._delete_units(unit_inventory)
-            if failed:
-                delete_failed.extend(failed)
-        except Exception:
-            msg = PURGE_UNITS_FAILED % {'r': repo_id}
-            log.exception(msg)
-            raise Exception(msg)
-
-        return ImporterReport(add_failed, delete_failed)
+        self._add_units(unit_inventory)
+        self._delete_units(unit_inventory)
 
 
 class Additive(ImporterStrategy):
@@ -314,7 +302,7 @@ class Additive(ImporterStrategy):
     that are not contained in the parent inventory are permitted to remain.
     """
 
-    def synchronize(self, repo_id):
+    def _synchronize(self, repo_id):
         """
         Performs the following steps:
           1. Read the (parent) manifest.
@@ -326,19 +314,7 @@ class Additive(ImporterStrategy):
         :rtype: Report
         """
         unit_inventory = self._unit_inventory(repo_id)
-
-        # add missing units
-        add_failed = []
-        try:
-            failed = self._add_units(unit_inventory)
-            if failed:
-                add_failed.extend(failed)
-        except Exception:
-            msg = ADD_UNITS_FAILED % {'r': repo_id}
-            log.exception(msg)
-            raise Exception(msg)
-
-        return ImporterReport(add_failed, [])
+        self._add_units(unit_inventory)
 
 
 # --- factory ---------------------------------------------------------------------------

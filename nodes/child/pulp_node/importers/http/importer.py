@@ -19,8 +19,9 @@ from pulp.common.download import factory
 from pulp.common.download.config import DownloaderConfig
 
 from pulp_node import constants
+from pulp_node.error import CaughtException
 from pulp_node.progress import RepositoryProgress
-from pulp_node.importers.reports import ProgressListener
+from pulp_node.importers.reports import ImporterReport, ProgressListener
 from pulp_node.importers.strategies import find_strategy
 
 
@@ -69,9 +70,6 @@ class NodesHttpImporter(Importer):
             'types' : ['node', 'repository']
         }
 
-    def __init__(self):
-        self.strategy = None
-
     def validate_config(self, repo, config, related_repos):
         """
         Validate the configuration.
@@ -118,21 +116,22 @@ class NodesHttpImporter(Importer):
         :return: A report describing the result.
         :rtype: pulp.server.plugins.model.SyncReport
         """
+        report = ImporterReport()
+
         try:
             downloader = self._downloader(config)
             strategy_name = config.get(constants.STRATEGY_KEYWORD)
             strategy_class = find_strategy(strategy_name)
             listener = ProgressListener(conduit)
             progress = RepositoryProgress(repo.id, listener)
-            self.strategy = strategy_class(conduit, config, downloader, progress)
+            strategy = strategy_class(conduit, config, downloader, progress, report)
             progress.begin_importing()
-            report = self.strategy.synchronize(repo.id)
-            details = dict(report=report.dict())
+            strategy.synchronize(repo.id)
         except Exception, e:
-            msg = repr(e)
-            log.exception(repo.id)
-            details = dict(exception=msg)
-        report = conduit.build_success_report({}, details)
+            report.errors.append(CaughtException(e, repo.id))
+
+        report.update(repo_id=repo.id)
+        report = conduit.build_success_report({}, report.dict())
         return report
 
     def _downloader(self, config):

@@ -34,6 +34,7 @@ from pulp.bindings.bindings import Bindings as PulpBindings
 from pulp.bindings.exceptions import NotFoundException
 from pulp.bindings.server import PulpConnection
 
+from pulp_node.error import PurgeOrphansError, RepoSyncRestError, GetBindingsError
 from pulp_node.poller import TaskPoller
 from pulp_node import constants
 from pulp_node import link
@@ -59,12 +60,6 @@ def subdict(adict, *keylist):
     :rtype: dict.
     """
     return dict([t for t in adict.items() if t[0] in keylist])
-
-
-# --- exceptions ------------------------------------------------------------------------
-
-class ModelError(Exception):
-    pass
 
 
 # --- pulp bindings ---------------------------------------------------------------------
@@ -242,7 +237,7 @@ class ChildRepository(Child, Repository):
         """
         http = cls.binding.content_orphan.remove_all()
         if http.response_code != httplib.ACCEPTED:
-            raise ModelError('purge_orphans() failed:%d', http.response_code)
+            raise PurgeOrphansError(http.response_code)
 
     def __init__(self, repo_id, details=None):
         """
@@ -397,7 +392,7 @@ class ChildRepository(Child, Repository):
             task = http.response_body[0]
             return self.poller.join(task.task_id, progress)
         else:
-            raise ModelError('synchronization failed: http=%d', http.response_code)
+            raise RepoSyncRestError(self.repo_id, http.response_code)
 
     def cancel_synchronization(self):
         """
@@ -620,7 +615,7 @@ class ParentBinding(Parent):
         if http.response_code == httplib.OK:
             return cls.filtered(http.response_body)
         else:
-            raise ModelError('fetch failed, http:%d', http.response_code)
+            raise GetBindingsError(http.response_code)
 
     @classmethod
     def fetch(cls, repo_ids):
@@ -639,7 +634,7 @@ class ParentBinding(Parent):
             if http.response_code == httplib.OK:
                 binds.extend(cls.filtered(http.response_body))
             else:
-                raise ModelError('fetch failed, http:%d', http.response_code)
+                raise GetBindingsError(http.response_code)
         return binds
 
     @classmethod

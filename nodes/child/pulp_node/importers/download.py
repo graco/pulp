@@ -16,6 +16,7 @@ from logging import getLogger
 
 from pulp.common.download.listener import DownloadEventListener
 from pulp.common.download.request import DownloadRequest
+from pulp_node.error import ErrorList, UnitDownloadError
 
 log = getLogger(__name__)
 
@@ -51,11 +52,7 @@ class DownloadListener(DownloadEventListener):
     def __init__(self, strategy, batch):
         self.strategy = strategy
         self.batch = batch
-        self.failed = []
-
-    @property
-    def progress(self):
-        return self.strategy.progress
+        self.errors = ErrorList()
 
     def download_started(self, report):
         try:
@@ -67,13 +64,7 @@ class DownloadListener(DownloadEventListener):
 
     def download_succeeded(self, report):
         unit = self.batch.units.get(report.url)
-        try:
-            self.strategy.add_unit(unit)
-        except Exception, e:
-            log.exception(report.url)
-            self.failed.append((unit, e))
+        self.strategy.add_unit(unit)
 
     def download_failed(self, report):
-        unit = self.batch.units[report.url]
-        self.failed.append((unit, report.error_report))
-        self.progress.set_action('downloaded_failed', report.url)
+        self.errors.append(UnitDownloadError())

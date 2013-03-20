@@ -31,6 +31,7 @@ DEFAULT_STRATEGY = ADDITIVE_STRATEGY
 # --- keywords ---------------------------------------------------------------
 
 STRATEGY_KEYWORD = 'strategy'
+PURGE_ORPHANS_KEYWORD = 'purge_orphans'
 PROTOCOL_KEYWORD = 'protocol'
 MANIFEST_URL_KEYWORD = 'manifest_url'
 
